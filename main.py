@@ -101,6 +101,13 @@ def train_mamba_encoder(data, args):
     使用自监督方式训练：用滑窗切出的子序列，让 Mamba 学习预测下一时间步。
     训练完成后，用编码器将整个时序数据编码为特征矩阵。
     """
+    # ★ 关键修复：强制恢复全局 dtype 为 float32
+    #   因为 DAGMA 的 fit() 会把全局 dtype 改成 double，
+    #   在 run_batch.py 的循环中，后续案例创建 Mamba 编码器时
+    #   全局 dtype 已经是 double，导致 nn.Linear 权重变成 double，
+    #   但输入数据是 FloatTensor(float32) → dtype 不匹配报错
+    torch.set_default_dtype(torch.float32)
+
     T, N = data.shape
     device = args.device
 
@@ -200,6 +207,9 @@ def run_dagma(feature_matrix, n_metrics, args):
         device=args.device
     )
 
+    # ★ 关键修复：DAGMA 完成后强制恢复 float32，防止污染后续 Mamba
+    torch.set_default_dtype(torch.float32)
+
     # 统计因果图信息
     n_edges = np.sum(W > 0)
     print(f"  学到的因果边数: {n_edges}")
@@ -230,10 +240,10 @@ def run_scoring(W, columns, data, args, fault_idx=None):
     print(f"{'='*50}")
 
     if args.no_scorer:
-        # 消融：不用 RobustScorer，用固定个性化向量
+        print(f"  [消融] 跳过 RobustScorer，使用纯 PageRank")
         G = build_causal_graph(W, columns)
-        dangling = [n for n, d in G.out_degree() if d == 0]
         personalization = {}
+        dangling = [n for n in G.nodes() if G.out_degree(n) == 0]
         for node in G.nodes():
             personalization[node] = 1.0 if node in dangling else 0.5
         try:
@@ -279,16 +289,20 @@ def main(args):
                 args.root_cause = fault_type
                 print(f"  [细颗粒度] 自动推断根因指标: {args.root_cause}")
 
-    # ====== 粗颗粒度：只保留各服务的 latency 列 ======
+    # ====== 粗颗粒度：只保留各服务的 latency-50 列（每个服务一个节点） ======
     if args.coarse_grained:
-        latency_cols = [c for c in columns if 'latency' in c or 'response' in c]
+        # 优先用 latency-50（P50中位数），每个服务只保留一个延迟指标
+        latency_cols = [c for c in columns if 'latency-50' in c]
         if len(latency_cols) == 0:
-            print("  WARNING: 未找到 latency/response 列，将使用全部列")
+            # 回退：尝试所有 latency/response 列
+            latency_cols = [c for c in columns if 'latency' in c or 'response' in c]
+        if len(latency_cols) == 0:
+            print("  WARNING: 未找到 latency 列，将使用全部列")
         else:
             col_idx = [columns.index(c) for c in latency_cols]
             data = data[:, col_idx]
             columns = latency_cols
-            print(f"  [粗颗粒度] 过滤后保留列: {columns}")
+            print(f"  [粗颗粒度] 保留 {len(columns)} 个服务延迟列: {columns}")
 
     # ====== 细颗粒度：只保留指定服务的资源指标列 ======
     if args.fine_grained_service:

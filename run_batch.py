@@ -65,16 +65,18 @@ def run_single_case(data_root, case_path, root_cause, args, service=None):
     data, columns, fault_idx = load_data(data_root, case_path)
     T, N = data.shape
 
-    # ====== 粗颗粒度：只保留各服务的 latency 列 ======
+    # ====== 粗颗粒度：只保留各服务的 latency-50 列（每个服务一个节点） ======
     if args.coarse_grained:
-        latency_cols = [c for c in columns if 'latency' in c or 'response' in c]
+        latency_cols = [c for c in columns if 'latency-50' in c]
         if len(latency_cols) == 0:
-            print(f"  WARNING: 未找到 latency/response 列，将使用全部列")
+            latency_cols = [c for c in columns if 'latency' in c or 'response' in c]
+        if len(latency_cols) == 0:
+            print(f"  WARNING: 未找到 latency 列，将使用全部列")
         else:
             col_idx = [columns.index(c) for c in latency_cols]
             data = data[:, col_idx]
             columns = latency_cols
-            print(f"  [粗颗粒度] 保留列数: {len(columns)}")
+            print(f"  [粗颗粒度] 保留 {len(columns)} 个服务延迟列")
 
     # ====== 细颗粒度：只保留指定服务的资源指标列 ======
     elif not args.fine_all and service is not None:

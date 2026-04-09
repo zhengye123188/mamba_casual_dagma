@@ -22,20 +22,23 @@ import math
 
 # ============================================================
 # LocallyConnected 层（来自 DAGMA 官方代码）
+# ★ 修复：添加 dtype 参数，用 torch.empty 替代 torch.Tensor
 # ============================================================
 
 class LocallyConnected(nn.Module):
     """Conv1dLocal() with filter size 1."""
 
-    def __init__(self, num_linear, input_features, output_features, bias=True):
+    def __init__(self, num_linear, input_features, output_features, bias=True, dtype=torch.double):
         super().__init__()
         self.num_linear = num_linear
         self.input_features = input_features
         self.output_features = output_features
 
-        self.weight = nn.Parameter(torch.Tensor(num_linear, input_features, output_features))
+        # ★ 原始代码用 torch.Tensor()，它的 dtype 跟随全局默认值（float32），
+        #   导致与 double 数据不匹配。改用 torch.empty + 显式 dtype。
+        self.weight = nn.Parameter(torch.empty(num_linear, input_features, output_features, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.Tensor(num_linear, output_features))
+            self.bias = nn.Parameter(torch.empty(num_linear, output_features, dtype=dtype))
         else:
             self.register_parameter('bias', None)
         self.reset_parameters()
@@ -59,6 +62,7 @@ class LocallyConnected(nn.Module):
 
 # ============================================================
 # DagmaMLP：建模结构方程的 MLP（来自 DAGMA 官方代码）
+# ★ 修复：所有张量创建都显式指定 dtype
 # ============================================================
 
 class DagmaMLP(nn.Module):
@@ -73,13 +77,23 @@ class DagmaMLP(nn.Module):
         assert len(dims) >= 2
         assert dims[-1] == 1
         self.dims, self.d = dims, dims[0]
-        self.I = torch.eye(self.d)
-        self.fc1 = nn.Linear(self.d, self.d * dims[1], bias=bias)
+        self.dtype = dtype  # ★ 保存 dtype 供后续使用
+
+        # ★ 原始: torch.eye(self.d) → float32
+        #   修复: torch.eye(self.d, dtype=dtype) → double
+        self.I = torch.eye(self.d, dtype=dtype)
+
+        # ★ 原始: nn.Linear(self.d, ...) → 权重 float32
+        #   修复: nn.Linear(..., dtype=dtype) → 权重 double
+        self.fc1 = nn.Linear(self.d, self.d * dims[1], bias=bias, dtype=dtype)
         nn.init.zeros_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
+
         layers = []
         for l in range(len(dims) - 2):
-            layers.append(LocallyConnected(self.d, dims[l + 1], dims[l + 2], bias=bias))
+            # ★ 原始: LocallyConnected(...) → 权重 float32
+            #   修复: LocallyConnected(..., dtype=dtype) → 权重 double
+            layers.append(LocallyConnected(self.d, dims[l + 1], dims[l + 2], bias=bias, dtype=dtype))
         self.fc2 = nn.ModuleList(layers)
 
     def forward(self, x):
@@ -116,6 +130,7 @@ class DagmaMLP(nn.Module):
 
 # ============================================================
 # DagmaNonlinear：DAGMA 优化器（基于官方代码，适配 MambaCausal）
+# ★ 修复：fit() 结束后恢复全局 dtype，避免污染 Mamba
 # ============================================================
 
 class DagmaNonlinear:
@@ -182,25 +197,11 @@ class DagmaNonlinear:
             lr=.0002, w_threshold=0.3, checkpoint=1000, device='cpu'):
         """
         运行 DAGMA 算法，从数据 X 中学习因果 DAG。
-
-        Args:
-            X: (n, d) 数据矩阵（Mamba 编码后的特征矩阵）
-            lambda1: L1 正则化系数
-            lambda2: L2 正则化系数
-            T: DAGMA 外循环迭代次数
-            mu_init: μ 初始值
-            mu_factor: μ 衰减因子
-            s: M-矩阵域控制参数
-            warm_iter: 预热迭代次数
-            max_iter: 最大迭代次数
-            lr: 学习率
-            w_threshold: 边权重阈值（小于此值的边被删除）
-            checkpoint: 打印间隔
-
-        Returns:
-            W_est: (d, d) 加权邻接矩阵（DAG）
         """
+        # ★ 保存原始全局 dtype，结束后恢复
+        _orig_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.dtype)
+
         if type(X) == torch.Tensor:
             self.X = X.type(self.dtype).to(device)
         elif type(X) == np.ndarray:
@@ -216,26 +217,30 @@ class DagmaNonlinear:
         elif type(s) in [int, float]:
             s = T * [s]
 
-        with tqdm(total=int((T - 1) * warm_iter + max_iter), desc="DAGMA") as pbar:
-            for i in range(int(T)):
-                self.vprint(f'\nDagma iter t={i + 1} -- mu: {mu}')
-                success, s_cur = False, s[i]
-                inner_iter = int(max_iter) if i == T - 1 else int(warm_iter)
-                model_copy = copy.deepcopy(self.model)
-                lr_cur = lr
-                lr_decay = False
+        try:
+            with tqdm(total=int((T - 1) * warm_iter + max_iter), desc="DAGMA") as pbar:
+                for i in range(int(T)):
+                    self.vprint(f'\nDagma iter t={i + 1} -- mu: {mu}')
+                    success, s_cur = False, s[i]
+                    inner_iter = int(max_iter) if i == T - 1 else int(warm_iter)
+                    model_copy = copy.deepcopy(self.model)
+                    lr_cur = lr
+                    lr_decay = False
 
-                while success is False:
-                    success = self.minimize(inner_iter, lr_cur, lambda1, lambda2,
-                                            mu, s_cur, lr_decay, pbar=pbar)
-                    if success is False:
-                        self.model.load_state_dict(model_copy.state_dict().copy())
-                        lr_cur *= 0.5
-                        lr_decay = True
-                        if lr_cur < 1e-10:
-                            break
-                        s_cur = 1
-                mu *= mu_factor
+                    while success is False:
+                        success = self.minimize(inner_iter, lr_cur, lambda1, lambda2,
+                                                mu, s_cur, lr_decay, pbar=pbar)
+                        if success is False:
+                            self.model.load_state_dict(model_copy.state_dict().copy())
+                            lr_cur *= 0.5
+                            lr_decay = True
+                            if lr_cur < 1e-10:
+                                break
+                            s_cur = 1
+                    mu *= mu_factor
+        finally:
+            # ★ 无论成功失败，都恢复全局 dtype 为 float32
+            torch.set_default_dtype(_orig_dtype)
 
         W_est = self.model.fc1_to_adj()
         W_est[np.abs(W_est) < w_threshold] = 0
@@ -244,6 +249,7 @@ class DagmaNonlinear:
 
 # ============================================================
 # 便捷接口：一键学习因果 DAG
+# ★ 修复：统一使用 torch.double
 # ============================================================
 
 def learn_causal_dag(feature_matrix, n_metrics, hidden_dim=10,
@@ -253,31 +259,15 @@ def learn_causal_dag(feature_matrix, n_metrics, hidden_dim=10,
                      verbose=False, device='cpu'):
     """
     从特征矩阵中学习因果 DAG 的便捷接口。
-
-    Args:
-        feature_matrix: numpy array (n_samples, d)，Mamba 编码后的特征
-        n_metrics: 指标数量 d
-        hidden_dim: DAGMA MLP 隐藏层维度
-        lambda1: L1 正则化
-        lambda2: L2 正则化
-        T: DAGMA 外循环次数
-        w_threshold: 边权重阈值
-        lr: 学习率
-        warm_iter: 预热迭代次数
-        max_iter: 最大迭代次数
-        verbose: 是否打印详细信息
-        device: 计算设备
-
-    Returns:
-        W: numpy array (d, d) 加权邻接矩阵（DAG）
     """
     # 数据标准化
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(feature_matrix)
 
-    # 构建 DAGMA 模型
-    eq_model = DagmaMLP(dims=[n_metrics, hidden_dim, 1], bias=True, dtype=torch.float)
+    # ★ 原始代码: dtype=torch.float → 与 fit() 里的 double 数据冲突
+    #   修复: 统一用 torch.double
+    eq_model = DagmaMLP(dims=[n_metrics, hidden_dim, 1], bias=True, dtype=torch.double)
     eq_model = eq_model.to(device)
 
     model = DagmaNonlinear(eq_model, verbose=verbose, dtype=torch.double)

@@ -1,196 +1,349 @@
 """
-MambaCausal v2 - 模块C：RobustScorer + PageRank 根因评分
+批量运行 RE1 数据集的所有故障案例（实时输出版）。
 
-职责：在 DAGMA 学出的因果 DAG 上，融合统计异常信号，输出根因排序。
+用法:
+  # 粗颗粒度（只用 latency 列，根因为服务名）
+  python run_batch.py --dataset RE1-SS --coarse_grained --device cuda:0 2>&1 | tee batch_ss_coarse.log
 
-融合三种信息：
-  1. 因果拓扑（谁导致了谁）—— 来自 DAGMA 的 DAG 结构
-  2. 因果强度（因果关系有多强）—— 来自 DAGMA 的边权重 W[i][j]
-  3. 异常程度（指标有多异常）—— 来自 RobustScorer 的异常分数
+  # 细颗粒度（已知故障服务，只用该服务资源指标）
+  python run_batch.py --dataset RE1-SS --device cuda:0 2>&1 | tee batch_ss_fine.log
+
+  # 细颗粒度（全量指标）
+  python run_batch.py --dataset RE1-SS --fine_all --device cuda:0 2>&1 | tee batch_ss_fine_all.log
+
+  python run_batch.py --dataset all --device cuda:0 2>&1 | tee batch_all.log
+  python run_batch.py --dataset RE1-SS --fault_type cpu --device cuda:0
 """
 
+import os
+import sys
+import json
+import time
+import argparse
+import traceback
 import numpy as np
-import networkx as nx
-from scipy import stats
+from datetime import datetime
+
+# 直接 import main 里的函数，不走子进程
+from main import load_data, train_mamba_encoder, run_dagma, run_scoring
+from models.root_cause_scorer import evaluate_ranking
+from sklearn.preprocessing import StandardScaler
 
 
-class RobustScorer:
+def find_cases(data_root, dataset, fault_type=None):
+    """扫描数据目录，找到所有故障案例。"""
+    dataset_dir = os.path.join(data_root, dataset)
+    if not os.path.exists(dataset_dir):
+        print(f"ERROR: 数据集目录不存在: {dataset_dir}")
+        return []
+
+    cases = []
+    for fault_dir in sorted(os.listdir(dataset_dir)):
+        fault_path = os.path.join(dataset_dir, fault_dir)
+        if not os.path.isdir(fault_path):
+            continue
+        parts = fault_dir.rsplit('_', 1)
+        if len(parts) != 2:
+            continue
+        service, ftype = parts
+        if fault_type and ftype != fault_type:
+            continue
+        for repeat in sorted(os.listdir(fault_path)):
+            repeat_path = os.path.join(fault_path, repeat)
+            if os.path.isdir(repeat_path):
+                case_path = f"{dataset}/{fault_dir}/{repeat}"
+                cases.append((case_path, service, ftype, repeat))
+    return cases
+
+
+def run_single_case(data_root, case_path, root_cause, args, service=None):
     """
-    基于 BARO 的 RobustScorer：计算每个指标的统计异常分数。
-    使用中位数和 MAD 的非参数方法，对极端值鲁棒。
+    直接调用 main 的各阶段函数，实时输出到终端。
+    返回排序结果、评估指标、邻接矩阵、列名。
     """
+    # 加载数据
+    data, columns, fault_idx = load_data(data_root, case_path)
+    T, N = data.shape
 
-    def __init__(self, method='modified_zscore'):
-        self.method = method
+    # ====== 粗颗粒度：只保留各服务的 latency-50 列（每个服务一个节点） ======
+    if args.coarse_grained:
+        latency_cols = [c for c in columns if 'latency-50' in c]
+        if len(latency_cols) == 0:
+            latency_cols = [c for c in columns if 'latency' in c or 'response' in c]
+        if len(latency_cols) == 0:
+            print(f"  WARNING: 未找到 latency 列，将使用全部列")
+        else:
+            col_idx = [columns.index(c) for c in latency_cols]
+            data = data[:, col_idx]
+            columns = latency_cols
+            print(f"  [粗颗粒度] 保留 {len(columns)} 个服务延迟列")
 
-    def compute_scores(self, pre_fault_data, post_fault_data):
-        """
-        Args:
-            pre_fault_data: (T1, N) 故障前数据
-            post_fault_data: (T2, N) 故障后数据
-        Returns:
-            scores: (N,) 异常分数
-        """
-        n_metrics = pre_fault_data.shape[1]
-        scores = np.zeros(n_metrics)
+    # ====== 细颗粒度：只保留指定服务的资源指标列 ======
+    elif not args.fine_all and service is not None:
+        svc_cols = [c for c in columns if c.startswith(service + '_') and 'latency' not in c and 'response' not in c]
+        if len(svc_cols) == 0:
+            print(f"  WARNING: 未找到服务 {service} 的资源指标列，将使用全部列")
+        else:
+            col_idx = [columns.index(c) for c in svc_cols]
+            data = data[:, col_idx]
+            columns = svc_cols
+            print(f"  [细颗粒度] 保留列数: {len(columns)}, 列: {columns}")
 
-        for i in range(n_metrics):
-            pre = pre_fault_data[:, i]
-            post = post_fault_data[:, i]
+    # fine_all 模式：不做任何列过滤，使用全量指标
 
-            if self.method == 'modified_zscore':
-                scores[i] = self._modified_zscore(pre, post)
-            elif self.method == 'iqr':
-                scores[i] = self._iqr_score(pre, post)
-            elif self.method == 'mannwhitney':
-                scores[i] = self._mannwhitney_score(pre, post)
-            else:
-                scores[i] = self._modified_zscore(pre, post)
+    # 阶段1: Mamba 编码
+    if args.no_mamba:
+        print(f"  [消融] 跳过 Mamba 编码")
+        scaler = StandardScaler()
+        Z = scaler.fit_transform(data)
+    else:
+        Z, encoder, scaler = train_mamba_encoder(data, args)
 
-        return scores
+    # 阶段2: DAGMA 因果图
+    W = run_dagma(Z, data.shape[1], args)
 
-    def _modified_zscore(self, pre, post):
-        median_pre = np.median(pre)
-        mad = np.median(np.abs(pre - median_pre))
-        if mad < 1e-10:
-            std_pre = np.std(pre)
-            if std_pre < 1e-10:
-                return np.abs(np.median(post) - median_pre)
-            return np.abs(np.median(post) - median_pre) / std_pre
-        median_post = np.median(post)
-        return np.abs(0.6745 * (median_post - median_pre) / mad)
+    # 阶段3: 根因评分
+    ranked_nodes, info = run_scoring(W, columns, data, args, fault_idx=fault_idx)
 
-    def _iqr_score(self, pre, post):
-        q1, q3 = np.percentile(pre, 25), np.percentile(pre, 75)
-        iqr = q3 - q1
-        if iqr < 1e-10:
-            return np.abs(np.median(post) - np.median(pre))
-        return np.abs(np.median(post) - np.median(pre)) / iqr
+    # 评估
+    result = evaluate_ranking(ranked_nodes, root_cause)
 
-    def _mannwhitney_score(self, pre, post):
+    return ranked_nodes, result, info, W, columns
+
+
+def main():
+    parser = argparse.ArgumentParser(description='批量运行 RE1 实验')
+    parser.add_argument('--data_root', type=str, default='./data')
+    parser.add_argument('--dataset', type=str, default='RE1-SS')
+    parser.add_argument('--fault_type', type=str, default=None)
+    parser.add_argument('--device', type=str, default='cuda:0')
+
+    # ====== 粗/细颗粒度开关 ======
+    parser.add_argument('--coarse_grained', action='store_true',
+                        help='粗颗粒度：只用 latency 列，根因为服务名')
+    parser.add_argument('--fine_all', action='store_true',
+                        help='细颗粒度全量：使用所有指标，根因为具体指标名')
+    # 不加这两个开关时，默认为细颗粒度（已知服务）：只用故障服务的资源指标列
+
+    # Mamba 参数
+    parser.add_argument('--seq_len', type=int, default=32)
+    parser.add_argument('--stride', type=int, default=1)
+    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--d_state', type=int, default=16)
+    parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--mamba_epochs', type=int, default=50)
+    parser.add_argument('--mamba_lr', type=float, default=0.001)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--use_official_mamba', action='store_true')
+
+    # DAGMA 参数
+    parser.add_argument('--dagma_hidden', type=int, default=10)
+    parser.add_argument('--dagma_lambda1', type=float, default=0.05)
+    parser.add_argument('--dagma_lambda2', type=float, default=0.005)
+    parser.add_argument('--dagma_T', type=int, default=5)
+    parser.add_argument('--dagma_lr', type=float, default=0.0002)
+    parser.add_argument('--dagma_threshold', type=float, default=0.5)
+    parser.add_argument('--dagma_warm_iter', type=int, default=5000)
+    parser.add_argument('--dagma_max_iter', type=int, default=8000)
+
+    # 评分参数
+    parser.add_argument('--scorer_method', type=str, default='modified_zscore')
+    parser.add_argument('--pagerank_alpha', type=float, default=0.85)
+    parser.add_argument('--fault_ratio', type=float, default=0.25)
+
+    # 消融开关
+    parser.add_argument('--no_mamba', action='store_true')
+    parser.add_argument('--no_scorer', action='store_true')
+
+    # ====== 补全 main.py 里有但之前缺失的参数 ======
+    parser.add_argument('--verbose', action='store_true')
+
+    args = parser.parse_args()
+
+    # 确定数据集
+    if args.dataset == 'all':
+        datasets = ['RE1-OB', 'RE1-SS', 'RE1-TT']
+    else:
+        datasets = [args.dataset]
+
+    all_cases = []
+    for ds in datasets:
+        all_cases.extend(find_cases(args.data_root, ds, args.fault_type))
+
+    # 打印实验模式
+    if args.coarse_grained:
+        mode_str = '粗颗粒度（latency列，根因=服务名）'
+    elif args.fine_all:
+        mode_str = '细颗粒度-全量指标（根因=service_ftype）'
+    else:
+        mode_str = '细颗粒度-已知服务（根因=service_ftype）'
+
+    print(f"\n{'#'*60}")
+    print(f"MambaCausal v2 批量实验")
+    print(f"数据集: {datasets}, 故障类型: {args.fault_type or '全部'}")
+    print(f"实验模式: {mode_str}")
+    print(f"总案例数: {len(all_cases)}")
+    print(f"{'#'*60}")
+
+    # 结果目录
+    os.makedirs('results', exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    config_tag = 'full'
+    if args.coarse_grained: config_tag = 'coarse'
+    elif args.fine_all: config_tag = 'fine_all'
+    if args.no_mamba: config_tag += '_no_mamba'
+    if args.no_scorer: config_tag += '_no_scorer'
+    if args.no_mamba and args.no_scorer: config_tag = config_tag.replace('_no_mamba_no_scorer', '_no_both')
+
+    # numpy/torch 类型转换
+    def convert(obj):
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, (np.ndarray,)): return obj.tolist()
+        if isinstance(obj, (np.bool_,)): return bool(obj)
+        return obj
+
+    # 逐个运行
+    all_results = []
+    ac_sums = {'AC@1': 0, 'AC@2': 0, 'AC@3': 0, 'AC@4': 0, 'AC@5': 0}
+
+    for i, (case_path, service, ftype, repeat) in enumerate(all_cases):
+        print(f"\n{'='*60}")
+        print(f"[{i+1}/{len(all_cases)}] {case_path}")
+        print(f"  根因服务: {service}, 故障类型: {ftype}, 重复: {repeat}")
+        print(f"{'='*60}")
+
+        # 根因标签：粗颗粒度用服务名，细颗粒度用具体指标名
+        if args.coarse_grained:
+            root_cause = service                  # 如 carts
+        else:
+            root_cause = f"{service}_{ftype}"     # 如 carts_cpu
+
+        start = time.time()
         try:
-            _, p_value = stats.mannwhitneyu(pre, post, alternative='two-sided')
-            if p_value < 1e-300:
-                p_value = 1e-300
-            return -np.log(p_value)
-        except ValueError:
-            return 0.0
+            ranked_nodes, r, info, W, columns = run_single_case(
+                args.data_root, case_path, root_cause, args, service=service
+            )
+            elapsed = time.time() - start
 
+            for k in ac_sums:
+                ac_sums[k] += r[k]
 
-def build_causal_graph(W, columns):
-    """
-    从 DAGMA 的加权邻接矩阵构建 NetworkX 有向图。
+            print(f"\n  >>> 结果: rank={r['rank']}, AC@1={r['AC@1']}, AC@3={r['AC@3']}, AC@5={r['AC@5']}, Avg@5={r['Avg@5']:.2f} ({elapsed:.1f}s)")
 
-    关键改进：使用 DAGMA 的边权重作为图的边权重，
-    而非 RUN 原始代码中所有边权重相同的做法。
+            case_record = {
+                'case': case_path,
+                'service': service,
+                'fault_type': ftype,
+                'repeat': repeat,
+                'elapsed': round(elapsed, 2),
+                'status': 'success',
+                'root_cause': root_cause,
+                'n_metrics': len(columns),
+                'columns': columns,
+                'graph_edges': info.get('graph_edges', -1),
+                'is_dag': info.get('is_dag', False),
+                'top10': ranked_nodes[:10],
+                'full_ranking': ranked_nodes,
+                **r,
+            }
+            # anomaly_scores 和 pagerank_scores 与单例保持一致
+            if 'anomaly_scores' in info:
+                case_record['anomaly_scores'] = info['anomaly_scores']
+            if 'pagerank_scores' in info:
+                case_record['pagerank_scores'] = info['pagerank_scores']
 
-    Args:
-        W: (d, d) DAGMA 输出的加权邻接矩阵，W[i][j] > 0 表示 j→i
-        columns: 指标名称列表
+            all_results.append(case_record)
 
-    Returns:
-        G: NetworkX DiGraph，带边权重
-    """
-    d = W.shape[0]
-    G = nx.DiGraph()
+            # 保存单个案例结果 JSON（与单例运行格式完全一致）
+            case_name = case_path.replace('/', '_')
+            case_file = f'results/{case_name}_{config_tag}_{timestamp}.json'
+            with open(case_file, 'w', encoding='utf-8') as f:
+                json.dump(case_record, f, indent=2, ensure_ascii=False, default=convert)
 
-    for i, col in enumerate(columns):
-        G.add_node(col)
+            # 保存单个案例邻接矩阵
+            adj_file = f'results/{case_name}_{config_tag}_{timestamp}_adj.npy'
+            np.save(adj_file, W)
 
-    for i in range(d):
-        for j in range(d):
-            if W[i][j] > 0:
-                # W[i][j] > 0 表示 j→i 的因果关系，权重为因果强度
-                G.add_edge(columns[j], columns[i], weight=W[i][j])
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"\n  >>> FAILED: {str(e)} ({elapsed:.1f}s)")
+            traceback.print_exc()
+            all_results.append({
+                'case': case_path, 'service': service, 'fault_type': ftype,
+                'repeat': repeat, 'elapsed': round(elapsed, 2), 'status': 'failed',
+                'root_cause': root_cause, 'error': str(e),
+                'AC@1': 0, 'AC@2': 0, 'AC@3': 0, 'AC@4': 0, 'AC@5': 0, 'Avg@5': 0, 'rank': -1
+            })
 
-    return G
+    # ====== 汇总 ======
+    n = len(all_results)
+    n_success = sum(1 for r in all_results if r['status'] == 'success')
 
+    print(f"\n\n{'#'*60}")
+    print(f"汇总结果")
+    print(f"{'#'*60}")
+    print(f"  总案例: {n}, 成功: {n_success}")
+    if n_success > 0:
+        for k in ['AC@1', 'AC@2', 'AC@3', 'AC@4', 'AC@5']:
+            print(f"  {k}: {ac_sums[k]}/{n_success} = {ac_sums[k]/n_success:.4f}")
+        avg5 = sum(ac_sums[f'AC@{i}'] for i in range(1, 6)) / (n_success * 5)
+        print(f"  Avg@5: {avg5:.4f}")
 
-def root_cause_ranking(W, columns, pre_fault_data, post_fault_data,
-                       scorer_method='modified_zscore',
-                       alpha=0.85, max_iter=100):
-    """
-    MambaCausal 的根因评分：融合 DAGMA 因果图和 RobustScorer 异常分数。
+    # 按故障类型分组
+    fault_types = sorted(set(r['fault_type'] for r in all_results))
+    print(f"\n--- 按故障类型分组 ---")
+    print(f"  {'类型':<8} {'n':<5} {'AC@1':<8} {'AC@3':<8} {'AC@5':<8} {'Avg@5':<8}")
+    for ft in fault_types:
+        ft_results = [r for r in all_results if r['fault_type'] == ft and r['status'] == 'success']
+        if ft_results:
+            ft_n = len(ft_results)
+            ft_ac1 = sum(r['AC@1'] for r in ft_results) / ft_n
+            ft_ac3 = sum(r['AC@3'] for r in ft_results) / ft_n
+            ft_ac5 = sum(r['AC@5'] for r in ft_results) / ft_n
+            ft_avg5 = sum(r.get('Avg@5', 0) for r in ft_results) / ft_n
+            print(f"  {ft:<8} {ft_n:<5} {ft_ac1:<8.4f} {ft_ac3:<8.4f} {ft_ac5:<8.4f} {ft_avg5:<8.4f}")
 
-    Args:
-        W: (d, d) DAGMA 加权邻接矩阵
-        columns: 指标名称列表
-        pre_fault_data: (T1, N) 故障前数据
-        post_fault_data: (T2, N) 故障后数据
-        scorer_method: 异常评分方法
-        alpha: PageRank 阻尼因子
-        max_iter: PageRank 最大迭代次数
+    # 保存汇总 JSON
+    avg5_overall = sum(ac_sums[f'AC@{i}'] for i in range(1, 6)) / max(n_success * 5, 1)
 
-    Returns:
-        ranked_nodes: 按根因可能性排序的节点列表
-        info: 包含中间结果的字典
-    """
-    # ====== 步骤1：构建带权因果图 ======
-    G = build_causal_graph(W, columns)
-
-    # ====== 步骤2：计算异常分数 ======
-    scorer = RobustScorer(method=scorer_method)
-    anomaly_scores = scorer.compute_scores(pre_fault_data, post_fault_data)
-
-    # ====== 步骤3：构建个性化向量 ======
-    smoothing = 1e-6
-    personalization = {}
-    total = 0.0
-    for i, col in enumerate(columns):
-        score = anomaly_scores[i] + smoothing
-        personalization[col] = score
-        total += score
-    for col in personalization:
-        personalization[col] /= total
-
-    # ====== 步骤4：运行 PageRank ======
-    try:
-        pagerank_scores = nx.pagerank(
-            G, alpha=alpha, personalization=personalization,
-            max_iter=max_iter, weight='weight'  # 使用 DAGMA 边权重
-        )
-    except nx.PowerIterationFailedConvergence:
-        pagerank_scores = personalization
-
-    # ====== 步骤5：排序 ======
-    ranked = sorted(pagerank_scores.items(), key=lambda x: x[1], reverse=True)
-    ranked_nodes = [node for node, _ in ranked]
-
-    info = {
-        'anomaly_scores': {columns[i]: anomaly_scores[i] for i in range(len(columns))},
-        'pagerank_scores': pagerank_scores,
-        'graph_nodes': G.number_of_nodes(),
-        'graph_edges': G.number_of_edges(),
-        'is_dag': nx.is_directed_acyclic_graph(G),
+    summary_file = f'results/batch_{args.dataset}_{config_tag}_{timestamp}.json'
+    summary = {
+        'dataset': args.dataset,
+        'fault_type': args.fault_type,
+        'mode': mode_str,
+        'config': config_tag,
+        'timestamp': timestamp,
+        'total_cases': n,
+        'success_cases': n_success,
+        'AC@1': ac_sums['AC@1'] / max(n_success, 1),
+        'AC@2': ac_sums['AC@2'] / max(n_success, 1),
+        'AC@3': ac_sums['AC@3'] / max(n_success, 1),
+        'AC@4': ac_sums['AC@4'] / max(n_success, 1),
+        'AC@5': ac_sums['AC@5'] / max(n_success, 1),
+        'Avg@5': avg5_overall,
+        'by_fault_type': {},
+        'cases': all_results,
     }
+    for ft in fault_types:
+        ft_results = [r for r in all_results if r['fault_type'] == ft and r['status'] == 'success']
+        if ft_results:
+            ft_n = len(ft_results)
+            summary['by_fault_type'][ft] = {
+                'n': ft_n,
+                'AC@1': sum(r['AC@1'] for r in ft_results) / ft_n,
+                'AC@3': sum(r['AC@3'] for r in ft_results) / ft_n,
+                'AC@5': sum(r['AC@5'] for r in ft_results) / ft_n,
+                'Avg@5': sum(r.get('Avg@5', 0) for r in ft_results) / ft_n,
+            }
 
-    return ranked_nodes, info
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False, default=convert)
+
+    print(f"\n  汇总结果已保存: {summary_file}")
+    print(f"  各案例结果已保存至 results/ 目录")
+    print(f"{'#'*60}")
 
 
-def evaluate_ranking(ranking, root_cause):
-    """
-    评估根因排序结果。
-
-    支持两种匹配模式：
-      1. 精确匹配：root_cause == node
-      2. 服务级别匹配：node 以 root_cause_ 开头（如 carts 匹配 carts_cpu, carts_latency-50）
-
-    取最先命中的位置作为排名。
-
-    Avg@5 = (AC@1 + AC@2 + AC@3 + AC@4 + AC@5) / 5
-    """
-    result = {'AC@1': 0, 'AC@2': 0, 'AC@3': 0, 'AC@4': 0, 'AC@5': 0, 'rank': -1}
-
-    for i, node in enumerate(ranking):
-        matched = (node == root_cause) or node.startswith(root_cause + '_')
-        if matched:
-            result['rank'] = i + 1
-            if i < 1: result['AC@1'] = 1
-            if i < 2: result['AC@2'] = 1
-            if i < 3: result['AC@3'] = 1
-            if i < 4: result['AC@4'] = 1
-            if i < 5: result['AC@5'] = 1
-            break
-
-    result['Avg@5'] = (result['AC@1'] + result['AC@2'] + result['AC@3'] + result['AC@4'] + result['AC@5']) / 5.0
-    return result
+if __name__ == "__main__":
+    main()
